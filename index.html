@@ -1,0 +1,1971 @@
+<!DOCTYPE HTML>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+        <style>
+            :root {
+                --vh: 1vh;
+                --gap: clamp(10px, 2vmin, 24px);
+                --edge: clamp(12px, 3vmin, 40px);
+                /* Phones held upright and squarish windows: the pads in a 2 × 2 grid near the top, leaving room below for the modulators and sigils */
+                --columns: 2;
+                --align: start;
+                --pad: min(calc((100vw - 2 * var(--edge) - var(--gap)) / 2), calc((62 * var(--vh) - var(--gap)) / 2));
+            }
+
+            @supports (height: 1dvh) {
+                :root {
+                    --vh: 1dvh; /* the height actually visible on phones, whatever their toolbars are doing */
+                }
+            }
+
+            /* Wider than 4:3: all four in a row through the middle, 40% of the height as always, unless the width runs out first */
+            @media (min-aspect-ratio: 4/3) {
+                :root {
+                    --columns: 4;
+                    --align: center;
+                    --pad: min(calc(40 * var(--vh)), calc((100vw - 2 * var(--edge) - 3 * var(--gap)) / 4));
+                }
+            }
+
+            html, body {
+                width: 100%;
+                height: 100%;
+                padding: 0;
+                margin: 0;
+                overflow: hidden;
+                background: #000;
+                /* No scrolling, zooming, rubber-banding, text selection, long-press menus or tap flashes: every press here is for the instruments */
+                touch-action: none;
+                overscroll-behavior: none;
+                user-select: none;
+                -webkit-user-select: none;
+                -webkit-touch-callout: none;
+                -webkit-tap-highlight-color: transparent;
+            }
+
+            body {
+                position: fixed;
+                inset: 0;
+            }
+
+            .stage {
+                position: fixed;
+                inset: 0;
+                display: grid;
+                grid-template-columns: repeat(var(--columns), var(--pad));
+                gap: var(--gap);
+                justify-content: center;
+                align-content: var(--align);
+                padding: max(var(--edge), env(safe-area-inset-top)) max(var(--edge), env(safe-area-inset-right))
+                         max(var(--edge), env(safe-area-inset-bottom)) max(var(--edge), env(safe-area-inset-left));
+            }
+
+            canvas.xy {
+                width: var(--pad);
+                height: var(--pad);
+                background: #111;
+                outline: 1px solid #333;
+                cursor: crosshair;
+            }
+
+            /* The small canvases the pendulum and firefly ring draw on, which travel with them */
+            canvas.floating {
+                position: fixed;
+                left: 0;
+                top: 0;
+                pointer-events: none; /* clicks reach the pads; grabbing a modulator is handled on the window */
+                will-change: transform;
+            }
+
+            html.over-pendulum, html.over-pendulum canvas.xy,
+            html.over-fireflies, html.over-fireflies canvas.xy {
+                cursor: grab;
+            }
+
+            html.holding-pendulum, html.holding-pendulum canvas.xy,
+            html.holding-fireflies, html.holding-fireflies canvas.xy {
+                cursor: grabbing;
+            }
+
+            /* The key, moon and flow sigils, floating in the corner; never smaller than a fingertip, and clear of notches and home bars */
+            .sigils {
+                position: fixed;
+                right: max(3vmin, env(safe-area-inset-right));
+                bottom: max(3vmin, env(safe-area-inset-bottom));
+                display: flex;
+                gap: max(1.5vmin, 8px);
+            }
+
+            canvas.sigil {
+                width: max(9vmin, 44px);
+                height: max(9vmin, 44px);
+            }
+
+            canvas.moon {
+                cursor: ns-resize;
+            }
+
+            canvas.key {
+                cursor: pointer;
+            }
+
+            canvas.flow {
+                cursor: pointer;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="stage"></div>
+        <script>
+            // Keep presses and drags from scrolling, zooming, selecting or opening menus, on phones and desktops alike
+            // (the CSS does most of this; these catch what some browsers, iPhones especially, still do anyway)
+            for (const type of ['contextmenu', 'selectstart', 'dragstart', 'gesturestart', 'dblclick']) {
+                addEventListener(type, e => e.preventDefault(), { passive: false });
+            }
+            document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+
+            // Canvas sharpness: the screen's own, up to 2×. Sharper screens (most phones are 3×) would cost a lot more drawing for
+            // a difference you can't really see in thin lines
+            function pixelRatio() {
+                return Math.min(window.devicePixelRatio || 1, 2);
+            }
+
+            const iterations = 20;
+            class XY {
+                constructor(defaultX, defaultY, draw, parent = document.querySelector('.stage')) {
+                    this.x = defaultX;
+                    this.y = defaultY;
+                    this.trueX = defaultX;
+                    this.trueY = defaultY;
+                    this.startX = defaultX;
+                    this.startY = defaultY;
+                    this.timeX = performance.now();
+                    this.timeY = performance.now();
+                    this.lerp = 1000; // transition duration in ms
+                    this.mods = {}; // each modulator's nudge and how strongly it applies here, by name: { x, y, amount }; set by the modulators
+
+                    this.draw = draw; // draw(ctx, x, y, width, height, now)
+                    this.canvas = document.createElement('canvas');
+                    this.canvas.className = 'xy';
+                    this.ctx = this.canvas.getContext('2d');
+                    parent.appendChild(this.canvas);
+
+                    this.canvas.addEventListener('pointerdown', e => {
+                        if (e.button !== 0) return;
+                        this.canvas.setPointerCapture(e.pointerId);
+                        this.setFromPointer(e);
+                    });
+                    this.canvas.addEventListener('pointermove', e => {
+                        if (this.canvas.hasPointerCapture(e.pointerId)) this.setFromPointer(e);
+                    });
+                }
+
+                static ease(t) {
+                    return 1 - Math.pow(1 - t, 3); // easeOutCubic
+                }
+
+                progress(start, now) {
+                    if (this.lerp <= 0) return 1;
+                    return Math.min(Math.max((now - start) / this.lerp, 0), 1);
+                }
+
+                update(now = performance.now()) {
+                    this.x = this.startX + (this.trueX - this.startX) * XY.ease(this.progress(this.timeX, now));
+                    this.y = this.startY + (this.trueY - this.startY) * XY.ease(this.progress(this.timeY, now));
+                    return { x: this.x, y: this.y };
+                }
+
+                setX(value) {
+                    if (value === this.trueX) return;
+                    const now = performance.now();
+                    this.startX = this.update(now).x;
+                    this.trueX = value;
+                    this.timeX = now;
+                }
+
+                setY(value) {
+                    if (value === this.trueY) return;
+                    const now = performance.now();
+                    this.startY = this.update(now).y;
+                    this.trueY = value;
+                    this.timeY = now;
+                }
+
+                // What the pad actually uses: its own (eased) value, plus each modulator's nudge, as strongly as that modulator is close.
+                // A nudge that isn't a real number is ignored, so nothing downstream (drawing loops, the sound) ever gets one
+                output(now) {
+                    let { x, y } = this.update(now);
+                    for (const mod of Object.values(this.mods)) {
+                        const nudgeX = mod.x * mod.amount, nudgeY = mod.y * mod.amount;
+                        if (Number.isFinite(nudgeX)) x += nudgeX;
+                        if (Number.isFinite(nudgeY)) y += nudgeY;
+                    }
+                    const clamp = v => Math.min(Math.max(v, 0), 1);
+                    return { x: clamp(x), y: clamp(y) };
+                }
+
+                getX(now) {
+                    return this.output(now).x;
+                }
+
+                getY(now) {
+                    return this.output(now).y;
+                }
+
+                // 0..1 across the square, y = 0 at the bottom
+                setFromPointer(e) {
+                    const rect = this.canvas.getBoundingClientRect();
+                    const clamp = v => Math.min(Math.max(v, 0), 1);
+                    this.setX(clamp((e.clientX - rect.left) / rect.width));
+                    this.setY(clamp(1 - (e.clientY - rect.top) / rect.height));
+                }
+
+                render(now) {
+                    const dpr = pixelRatio();
+                    const width = this.canvas.clientWidth;
+                    const height = this.canvas.clientHeight;
+                    if (this.canvas.width !== Math.round(width * dpr) || this.canvas.height !== Math.round(height * dpr)) {
+                        this.canvas.width = Math.round(width * dpr);
+                        this.canvas.height = Math.round(height * dpr);
+                    }
+
+                    const { x, y } = this.output(now);
+                    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    this.ctx.clearRect(0, 0, width, height);
+                    this.draw(this.ctx, x, y, width, height, now);
+                }
+            }
+
+            // Ring LFOs: each ring runs a little behind the one before, so a wave travels through the stack
+            const ringLag = 0.5;       // radians each ring lags the one before
+            const widthRate = 0.2;     // vortex rings' widths swell and shrink: Hz...
+            const widthSize = 5;       // ...and pixels either way
+            const heightRate = 0.2;    // orbital rings' heights swell and shrink: Hz...
+            const heightSize = 3;      // ...and pixels either way
+
+            function ringLFO(wave, rate, size, i, now) {
+                return size * wave(2 * Math.PI * rate * now / 1000 - i * ringLag);
+            }
+
+            function drawVortex(ctx, param_X, param_Y, parentWidth, parentHeight, now) {
+                const rings = Math.max(1,param_X * iterations);
+                const padding = 0.9
+                for (let i = 0; i < rings; i++) {
+                    let heightOffset = (((parentHeight * (1 - param_Y))/2) * (param_X / 2));
+                    let drawHeight = i * parentHeight/rings * (1 - param_Y) * (i/rings*.7) - heightOffset;
+                    let ringWidth = ((rings - i)/rings * 0.5) * padding;
+                    // Never below 0: the innermost ring can be only a few pixels wide, and a negative radius would stop the canvas drawing
+                    let radiusX = Math.max(0, parentWidth * ringWidth + ringLFO(Math.sin, widthRate, widthSize, i, now));
+                    ctx.beginPath();
+                    ctx.ellipse(parentWidth/2, parentHeight/2 + drawHeight, radiusX, parentHeight * param_Y * ringWidth, 0, 0, Math.PI * 2);
+                    ctx.lineWidth = 1;
+                    ctx.strokeStyle = `rgba(255,255,255,${1 - (i/rings)})`;
+                    ctx.stroke(); // Draws the stroke centered on the path
+
+                }
+            }
+
+            function drawOrbital(ctx, param_Y, param_X, parentWidth, parentHeight, now) {
+                const nucleus = parentHeight/10;
+                const rings = Math.max(1,param_Y * iterations);
+                const padding = 0.9
+                const minWidth = 0.15; // smallest ring radius; must stay above the nucleus (0.1) so face-on rings never cross it
+                const orbits = [];
+                for (let i = 0; i < rings; i++) {
+                    // param_X sets how far the rings fan out from each other. min(i, rings - 1) makes a new ring
+                    // start exactly on top of the previous one and slide out as rings grows, so nothing pops in
+                    let offset = Math.PI/rings * Math.min(i, rings - 1) * param_X;
+                    // Each ring is a full-size circle tilted away from the viewer by `tilt`
+                    let tilt = param_X * Math.PI + offset;
+                    // Smallest at a 60° tilt, so small rings are flattened ellipses rather than circles.
+                    // sin² (not |sin|) so the size eases in and out of its minimum
+                    let ringWidthX = minWidth + (padding/2 - minWidth) * Math.sin(tilt - Math.PI/3) ** 2;
+                    let ringWidthY = ringWidthX * Math.abs(Math.cos(tilt));
+                    let radiusX = parentWidth * ringWidthX;
+                    // Never below 0: an edge-on ring is already flat, and a negative radius would stop the canvas drawing
+                    let radiusY = Math.max(0, parentHeight * ringWidthY + ringLFO(Math.cos, heightRate, heightSize, i, now));
+                    // Top half is the far side while sin(2*tilt) > 0; it only swaps when the ring is face-on or edge-on
+                    let backStart = Math.sin(2 * tilt) > 0 ? Math.PI : 0;
+                    orbits.push({ offset, radiusX, radiusY, backStart, alpha: ringWidthX + ringWidthY });
+                }
+
+                function drawHalf(orbit, start) {
+                    ctx.beginPath();
+                    ctx.ellipse(parentWidth/2, parentHeight/2, orbit.radiusX, orbit.radiusY, orbit.offset, start, start + Math.PI);
+                    ctx.lineWidth = 1;
+                    ctx.strokeStyle = `rgba(255,255,255,${orbit.alpha})`;
+                    ctx.stroke(); // Draws the stroke centered on the path
+                }
+
+                // Back halves first, so the center can cover them
+                for (const orbit of orbits) drawHalf(orbit, orbit.backStart);
+
+                ctx.beginPath();
+                ctx.ellipse(parentWidth/2, parentHeight/2, nucleus, nucleus, 0, 0, Math.PI * 2);
+                ctx.globalCompositeOperation = 'destination-out'; // erase what's behind the center
+                ctx.fill();
+                ctx.globalCompositeOperation = 'source-over';
+                ctx.lineWidth = 1;
+                ctx.strokeStyle = 'white'
+                ctx.stroke(); // Draws the stroke centered on the path
+
+                // Front halves pass over the center
+                for (const orbit of orbits) drawHalf(orbit, orbit.backStart + Math.PI);
+            }
+
+            // Wrapped in a closure so the sim state survives between frames.
+            // draw is what the pad calls every frame; bodies and blackHole are shared with the sound
+            const gravitySim = (() => {
+
+                const numBodies = 5;
+                const gravity = 2;           // pull with the pad's Y in the middle
+                const placementRadius = 300;
+                const radius = 70;           // heaviest body; a body's mass is also its size
+                const density = 30;
+                const blackHoleMass = 400;
+                const blackHoleSize = 80;    // drawn radius, in world units
+                const softening = 60;        // stops close passes from flinging bodies off at absurd speeds
+                const maxSpeed = 20;         // only catches runaway slingshots; a lower cap drains energy and everything sinks into the black hole
+                const bounds = 50;
+                const wallStrength = 0.001;  // walls push back harder the further a body goes past them
+                const framerate = 100;       // sim steps per second at 1x; everything in the pad moves at half the speed it did at 200
+                const worldSize = 1000;      // the sim runs in its own square world
+                const viewSize = 900;        // world units across the pad; the walls sit at its edge, so bodies leave the screen when they overshoot them
+                const contourStep = 2;       // gravity between the rings drawn around the black hole
+
+                const iterations = 1;
+                const FIXED = 1/iterations;      // sim step size
+
+                const tailLength = 250;      // sim steps of trail at 1x speed
+                const ringGap = 0.6;         // distance a body travels between trail rings, as a fraction of its size, so every trail reads as an overlapping tube
+                const bodies = [];
+                const center = worldSize / 2;
+                const blackHole = { x: center, y: center, mass: blackHoleMass, size: blackHoleSize }; // pinned in the middle of the pad
+
+                let pull = gravity;          // set from the pad's Y each frame
+                let tailSteps = tailLength;  // set from the pad's X each frame
+                let stepCount = 0;
+                let scale = 1;
+                let last = null;
+                let acc = 0;
+
+                class Body {
+                    constructor(x,y,xV,yV,mass,weight,tail) {
+                        this.x = x;
+                        this.y = y;
+                        this.xV = xV;
+                        this.yV = yV;
+                        this.mass = mass;
+                        this.weight = weight;
+                        this.tail = [];
+                        this.travel = 0; // distance moved since the last trail ring
+                        this.prevX = x;  // where it was before the latest step, for drawing it between steps
+                        this.prevY = y;
+                    }
+
+                    static random() {
+                        let thisX = Math.random() * worldSize;
+                        let thisY = Math.random() * worldSize;
+                        let thisXV = Math.random() - 0.5;
+                        let thisYV = Math.random() - 0.5;
+                        let thisMass = radius * (0.3 + 0.7 * Math.random()); // no tiny bodies
+                        let thisDensity = Math.random() * density;
+                        return new Body(thisX,thisY,thisXV,thisYV,thisMass,thisDensity);
+                    }
+
+                    setPos(x, y) {
+                        this.x = this.prevX = x;
+                        this.y = this.prevY = y;
+                    }
+
+                    // Kept above 4px so light bodies don't vanish
+                    screenRadius() {
+                        return Math.max(Math.abs(this.mass) * scale, 4);
+                    }
+
+                    // Rings that shrink and fade as they age, like the rings on the other pads. `shownStep` is the moment being drawn,
+                    // which falls between steps, so they age smoothly even when steps are few
+                    drawTail(ctx, parentWidth, parentHeight, shownStep) {
+                        ctx.lineWidth = 1;
+                        for (let i = 0; i < this.tail.length; i++) {
+                            if (this.tail[i].step > shownStep) continue; // dropped by the latest step, which the head hasn't been drawn reaching yet
+                            let life = 1 - (shownStep - this.tail[i].step) / tailSteps; // 1 when new, 0 when it drops off
+                            if (life <= 0) continue; // the trail just got shorter and no step has run yet to drop this ring
+                            ctx.beginPath();
+                            ctx.arc(parentWidth/2 + (this.tail[i].x - center) * scale,
+                                parentHeight/2 + (this.tail[i].y - center) * scale,
+                                this.screenRadius() * life, 0, 2 * Math.PI);
+                            ctx.strokeStyle = `rgba(255,255,255,${life})`;
+                            ctx.stroke();
+                        }
+                    }
+
+                    // `between` is how far it is from the last step to the next, 0 to 1; it's drawn that far along its latest move
+                    drawHead(ctx, parentWidth, parentHeight, between) {
+                        const x = this.prevX + (this.x - this.prevX) * between;
+                        const y = this.prevY + (this.y - this.prevY) * between;
+                        drawHollow(ctx, parentWidth/2 + (x - center) * scale, parentHeight/2 + (y - center) * scale, this.screenRadius());
+                    }
+                }
+
+                // Erases what's behind it, then outlines it, like the orbital pad's nucleus
+                function drawHollow(ctx, x, y, r) {
+                    ctx.beginPath();
+                    ctx.arc(x, y, r, 0, 2 * Math.PI);
+                    ctx.globalCompositeOperation = 'destination-out';
+                    ctx.fill();
+                    ctx.globalCompositeOperation = 'source-over';
+                    ctx.lineWidth = 1;
+                    ctx.strokeStyle = 'white';
+                    ctx.stroke();
+                }
+
+                function populate() {
+                    let spacing = (2 * Math.PI) / numBodies
+                    for (let i = 0; i < numBodies; i++) {
+                        let newBody = Body.random();
+                        let r = placementRadius * (0.7 + 0.6 * Math.random());
+                        let x = (Math.sin(spacing * i) * r) + center;
+                        let y = (Math.cos(spacing * i) * r) + center;
+                        newBody.setPos(x,y);
+                        // Start roughly on a circular orbit around the black hole, so nothing falls straight in
+                        let orbitSpeed = Math.sqrt(gravity * blackHoleMass / r) * (0.8 + 0.4 * Math.random());
+                        newBody.xV = Math.cos(spacing * i) * orbitSpeed;
+                        newBody.yV = -Math.sin(spacing * i) * orbitSpeed;
+                        bodies.push(newBody);
+                    }
+                }
+
+                // Lines of equal gravity around the black hole: none with no pull, and they spread out and multiply as pull grows.
+                // Negative pull (everything pushes apart) draws them dashed
+                function drawContours(ctx, parentWidth, parentHeight) {
+                    // Ring k sits at |pull| × mass / (k × step), so the last one outside the black hole is ring `rings`. Counting them up
+                    // front means a pull that isn't a real number draws nothing, instead of looping forever waiting for a ring small enough
+                    const rings = Math.floor(Math.abs(pull) * blackHoleMass / (contourStep * blackHoleSize));
+                    if (!Number.isFinite(rings)) return;
+                    ctx.lineWidth = 1;
+                    ctx.setLineDash(pull < 0 ? [3, 5] : []);
+                    for (let k = 1; k <= rings; k++) {
+                        let r = Math.abs(pull) * blackHoleMass / (k * contourStep);
+                        if (r <= blackHoleSize) break;
+                        let alpha = 0.35 * (1 - r / (viewSize / 2)); // fade out toward the edge of the pad
+                        if (alpha <= 0) continue;
+                        ctx.beginPath();
+                        ctx.arc(parentWidth/2, parentHeight/2, r * scale, 0, 2 * Math.PI);
+                        ctx.strokeStyle = `rgba(255,255,255,${alpha})`;
+                        ctx.stroke();
+                    }
+                    ctx.setLineDash([]);
+                }
+
+                function drawBodies(ctx, parentWidth, parentHeight, between) {
+                    drawContours(ctx, parentWidth, parentHeight);
+                    drawHollow(ctx, parentWidth/2, parentHeight/2, blackHoleSize * scale);
+                    // Every trail before any head, so the heads sit on top of all of them
+                    for (let i = 0; i < bodies.length; i++) {
+                        bodies[i].drawTail(ctx, parentWidth, parentHeight, stepCount - 1 + between);
+                    }
+                    for (let i = 0; i < bodies.length; i++) {
+                        bodies[i].drawHead(ctx, parentWidth, parentHeight, between);
+                    }
+                }
+
+                function attract(body, other, dt) {
+                    let xD = other.x - body.x;
+                    let yD = other.y - body.y;
+                    let r = Math.sqrt((xD * xD) + (yD * yD) + (body.weight * body.weight) + (softening * softening));
+                    let mag = (pull * other.mass) / (r * r);
+                    body.xV += (mag * (xD/r)) * dt;
+                    body.yV += (mag * (yD/r)) * dt;
+                }
+
+                function step(dt) {
+                    stepCount++;
+                    for (let i = 0; i < bodies.length; i++) {
+                        if (bodies[i].x < bounds)             { bodies[i].xV += (bounds - bodies[i].x) * wallStrength * dt; }
+                        if (bodies[i].x > worldSize - bounds) { bodies[i].xV -= (bodies[i].x - (worldSize - bounds)) * wallStrength * dt; }
+                        if (bodies[i].y < bounds)             { bodies[i].yV += (bounds - bodies[i].y) * wallStrength * dt; }
+                        if (bodies[i].y > worldSize - bounds) { bodies[i].yV -= (bodies[i].y - (worldSize - bounds)) * wallStrength * dt; }
+
+                        attract(bodies[i], blackHole, dt);
+                        for (let j = 0; j < bodies.length; j++) {
+                            if (i === j) { continue; }
+                            attract(bodies[i], bodies[j], dt);
+                        }
+
+                        let v = Math.hypot(bodies[i].xV, bodies[i].yV);
+                        if (v > maxSpeed) {
+                            bodies[i].xV *= maxSpeed / v;
+                            bodies[i].yV *= maxSpeed / v;
+                        }
+                    }
+
+                    for (let i = 0; i < bodies.length; i++) {
+                        bodies[i].prevX = bodies[i].x;
+                        bodies[i].prevY = bodies[i].y;
+                        bodies[i].x += (bodies[i].xV) * dt;
+                        bodies[i].y += (bodies[i].yV) * dt;
+                        // Rings are dropped by distance, not time, so trails stay evenly spaced at any speed; they stay where they were dropped
+                        bodies[i].travel += Math.hypot(bodies[i].xV, bodies[i].yV) * dt;
+                        if (bodies[i].travel >= Math.abs(bodies[i].mass) * ringGap) {
+                            bodies[i].tail.push({ x: bodies[i].x, y: bodies[i].y, step: stepCount });
+                            bodies[i].travel = 0;
+                        }
+                        while (bodies[i].tail.length > 0 && stepCount - bodies[i].tail[0].step >= tailSteps) {
+                            bodies[i].tail.shift();
+                        }
+                    }
+                }
+
+                populate();
+
+                function draw(ctx, param_X, param_Y, parentWidth, parentHeight, now) {
+                    const speed = 5 ** (param_X * 2 - 1);  // 0.2x at the left, 1x in the middle, 5x at the right
+                    pull = gravity * (6 * param_Y - 2);     // -4 (pushes apart) at the bottom, none a third of the way up, 2 in the middle, 8 at the top
+                    tailSteps = tailLength * speed;         // trails last the same real time, so faster bodies leave longer trails
+                    scale = Math.min(parentWidth, parentHeight) / viewSize; // fixed camera, centred on the black hole
+
+                    // Fixed-rate sim: speed changes how many steps run, not their size, so orbits trace the same paths at any speed.
+                    // Elapsed time is clamped so a stalled tab doesn't fast-forward and a timestamp from the past can't stall it
+                    if (last === null) last = now;
+                    acc += Math.min(Math.max(now - last, 0), 100) / (1000 / framerate) * speed;
+                    last = now;
+                    while (acc >= 1) {
+                        step(FIXED);
+                        acc -= FIXED;
+                    }
+                    // The steps stay exactly as they were; drawing goes the leftover fraction of the way toward the next one, so motion is
+                    // smooth at any speed and refresh rate instead of moving only on frames where a step happened
+                    drawBodies(ctx, parentWidth, parentHeight, acc);
+                }
+
+                return { draw, bodies, blackHole, viewSize };
+            })();
+
+            // Perlin noise lines, ported from perlin_field.html. The noise height is fixed.
+            // X = edge smoothness: at the left the noise tapers off gradually from the middle, at the right it runs right up to the edges
+            // Y = noise scale: broad swells at the bottom, finer ripples at the top, zooming from the centre of the pad
+            const drawField = (() => {
+                const lineQuantity = iterations;
+                const lineSegments = 120;
+                const noiseHeight = 0.0525;   // fraction of the pad's height; where the old height control sat at 0.35
+                const minScale = 0.2;         // noise scale at the bottom of Y...
+                const maxScale = 0.8;         // ...up to perlin_field.html's default at the top; much finer gets spiky with 120 points per line
+                const maxSharpness = 12;      // how abruptly the noise stops at the edges at the right of X; 1 at the left is a smooth sine taper
+                const edgeFade = 0.08;        // fraction of the width the lines fade out over at the left and right
+                const noiseOrigin = 40;       // where the pad's centre sits in the noise; far enough from 0 that every sample is positive
+
+                const diagonal = Math.SQRT1_2;
+                // Built once, not for every sample
+                const gradients = [
+                    [diagonal, diagonal, 0], [-diagonal, diagonal, 0],
+                    [diagonal, -diagonal, 0], [-diagonal, -diagonal, 0],
+                    [diagonal, 0, diagonal], [-diagonal, 0, diagonal],
+                    [diagonal, 0, -diagonal], [-diagonal, 0, -diagonal],
+                    [0, diagonal, diagonal], [0, -diagonal, diagonal],
+                    [0, diagonal, -diagonal], [0, -diagonal, -diagonal]
+                ];
+                // The taper along each line never changes, so it's worked out once too
+                const segmentTaper = Float64Array.from({ length: lineSegments }, (_, j) => Math.sin(Math.PI * j / (lineSegments - 1)));
+
+                // Same hash as perlin_field.html's gradient_dot, returning which gradient it picks
+                function gradientIndex(cellX, cellY, cellZ) {
+                    let hash = Math.imul(cellX, 374761393)
+                        + Math.imul(cellY, 668265263)
+                        + Math.imul(cellZ, 1442695041);
+                    hash = Math.imul(hash ^ (hash >>> 13), 1274126177);
+                    hash ^= hash >>> 16;
+                    return (hash >>> 0) % gradients.length;
+                }
+
+                function fade(value) {
+                    return value * value * value * (value * (value * 6 - 15) + 10);
+                }
+
+                function interpolate(start, end, amount) {
+                    return start + amount * (end - start);
+                }
+
+                // At scale 1 the lines cover 10 noise units top to bottom and 20 across, like perlin_field.html's 100 lines × 200 segments
+                function noiseX(i, scale) {
+                    return noiseOrigin + 10 * scale * ((i + 0.5) / lineQuantity - 0.5);
+                }
+
+                function noiseY(j, scale) {
+                    return noiseOrigin + 20 * scale * (j / (lineSegments - 1) - 0.5);
+                }
+
+                // Time (the noise's z) moves on its own, and while it stays inside one noise cell every sample is a fixed part plus
+                // a straight line in z on each of the cell's two z faces. So the faces are only worked out again when time crosses
+                // into the next cell (every ~7 seconds) or the scale changes, and each frame just finishes the z interpolation.
+                // Same noise as perlin_field.html
+                const faces = new Float64Array(lineQuantity * lineSegments * 4); // per sample: near face fixed, slope, far face fixed, slope
+                let facesCell = null;
+                let facesScale = null;
+
+                // Which gradient sits at each lattice point the samples touch: hashed once per point instead of eight times per sample
+                const latticeWidth = Math.ceil(10 * maxScale) + 3;
+                const latticeDepth = Math.ceil(20 * maxScale) + 3;
+                const lattice = new Uint8Array(latticeWidth * latticeDepth * 2);
+                const segmentCell = new Int32Array(lineSegments);
+                const segmentLocal = new Float64Array(lineSegments);
+                const segmentFade = new Float64Array(lineSegments);
+
+                function buildFaces(cellZ, scale) {
+                    facesCell = cellZ;
+                    facesScale = scale;
+                    const firstX = Math.floor(noiseX(0, scale));
+                    const firstY = Math.floor(noiseY(0, scale));
+                    const width = Math.floor(noiseX(lineQuantity - 1, scale)) - firstX + 2;
+                    const depth = Math.floor(noiseY(lineSegments - 1, scale)) - firstY + 2;
+                    for (let z = 0; z < 2; z++) {
+                        for (let y = 0; y < depth; y++) {
+                            for (let x = 0; x < width; x++) {
+                                lattice[(z * latticeDepth + y) * latticeWidth + x] = gradientIndex(firstX + x, firstY + y, cellZ + z);
+                            }
+                        }
+                    }
+                    // Along a line, the y side of each sample is the same for every line
+                    for (let j = 0; j < lineSegments; j++) {
+                        const y = noiseY(j, scale);
+                        segmentCell[j] = Math.floor(y);
+                        segmentLocal[j] = y - segmentCell[j];
+                        segmentFade[j] = fade(segmentLocal[j]);
+                        segmentCell[j] -= firstY;
+                    }
+
+                    let k = 0;
+                    for (let i = 0; i < lineQuantity; i++) {
+                        const x = noiseX(i, scale), cellX = Math.floor(x), localX = x - cellX, fadeX = fade(localX);
+                        for (let j = 0; j < lineSegments; j++) {
+                            const localY = segmentLocal[j], fadeY = segmentFade[j];
+                            for (let offsetZ = 0; offsetZ <= 1; offsetZ++) {
+                                const corner = (offsetZ * latticeDepth + segmentCell[j]) * latticeWidth + cellX - firstX;
+                                const g00 = gradients[lattice[corner]];
+                                const g10 = gradients[lattice[corner + 1]];
+                                const g01 = gradients[lattice[corner + latticeWidth]];
+                                const g11 = gradients[lattice[corner + latticeWidth + 1]];
+                                // The part of each corner's dot product that doesn't depend on z...
+                                faces[k++] = interpolate(
+                                    interpolate(g00[0] * localX + g00[1] * localY, g10[0] * (localX - 1) + g10[1] * localY, fadeX),
+                                    interpolate(g01[0] * localX + g01[1] * (localY - 1), g11[0] * (localX - 1) + g11[1] * (localY - 1), fadeX),
+                                    fadeY);
+                                // ...and how fast it changes with z
+                                faces[k++] = interpolate(interpolate(g00[2], g10[2], fadeX), interpolate(g01[2], g11[2], fadeX), fadeY);
+                            }
+                        }
+                    }
+                }
+
+                return function(ctx, param_X, param_Y, parentWidth, parentHeight, now) {
+                    const height = noiseHeight * parentHeight;
+                    const sharpness = maxSharpness ** param_X; // perlin_field.html's 1 / edge_smoothness
+                    const scale = minScale * (maxScale / minScale) ** param_Y;
+                    const noiseTime = now / 1000 * 0.15;
+                    const lineSpacing = parentHeight / lineQuantity;
+                    const segmentSpacing = parentWidth / (lineSegments - 1);
+
+                    const cellZ = Math.floor(noiseTime);
+                    if (cellZ !== facesCell || scale !== facesScale) buildFaces(cellZ, scale);
+                    const localZ = noiseTime - cellZ;
+                    const fadeZ = fade(localZ);
+
+                    // Every line goes in one path with one stroke; stroking each segment on its own was most of the original's cost
+                    ctx.beginPath();
+                    let k = 0;
+                    for (let i = 0; i < lineQuantity; i++) {
+                        const lineY = (i + 0.5) * lineSpacing;
+                        const lineTaper = Math.sin(Math.PI * (i + 0.5) / lineQuantity);
+                        for (let j = 0; j < lineSegments; j++, k += 4) {
+                            const near = faces[k] + faces[k + 1] * localZ;
+                            const far = faces[k + 2] + faces[k + 3] * (localZ - 1);
+                            const noise = Math.max(0, Math.min(1, 0.5 + interpolate(near, far, fadeZ)));
+                            const edge = Math.min(segmentTaper[j] * lineTaper * sharpness, 1);
+                            const offset = edge * (noise * 2 - 1) * height;
+                            if (j === 0) ctx.moveTo(0, lineY + offset);
+                            else ctx.lineTo(j * segmentSpacing, lineY + offset);
+                        }
+                    }
+
+                    // Lines fade out over the last bit of the left and right edges
+                    const edgeGradient = ctx.createLinearGradient(0, 0, parentWidth, 0);
+                    edgeGradient.addColorStop(0, 'rgba(255,255,255,0)');
+                    edgeGradient.addColorStop(edgeFade, 'white');
+                    edgeGradient.addColorStop(1 - edgeFade, 'white');
+                    edgeGradient.addColorStop(1, 'rgba(255,255,255,0)');
+                    ctx.lineWidth = 1;
+                    ctx.strokeStyle = edgeGradient;
+                    ctx.stroke();
+                };
+            })();
+
+            const vortex = new XY(0.5, 0.5, drawVortex);
+            const orbital = new XY(0.5, 0.5, drawOrbital);
+            const gravity = new XY(0.5, 0.5, gravitySim.draw);
+            const field = new XY(0.5, 0.5, drawField);
+            const pads = [vortex, orbital, gravity, field];
+
+            // Sound: every gravity body is an FM voice that sings when it's near another body or the black hole.
+            //   orbital pad: X = LP24 cutoff,      Y = FM amount
+            //   vortex pad:  X = delay,            Y = reverb
+            //   field pad:   X = wow and flutter,  Y = tape wear (saturation, dropouts, pops and crackle)
+            // Scales the voices can sing in, as semitones above the root; the key sigil in the corner picks one
+            const scales = [
+                [0, 3, 5, 7, 10],                // minor pentatonic
+                [0, 2, 4, 7, 9],                 // major pentatonic
+                [0, 2, 3, 7, 8],                 // hirajoshi
+                [0, 1, 5, 7, 10],                // in-sen
+                [0, 2, 3, 5, 7, 9, 10],          // dorian
+                [0, 1, 3, 5, 7, 8, 10],          // phrygian
+                [0, 2, 4, 6, 7, 9, 11],          // lydian
+                [0, 2, 4, 6, 8, 10],             // whole tone
+            ];
+            let scaleIndex = 0;                  // set by the key sigil
+            const rootFrequency = 110;           // A2
+            const hearingRange = 200;            // gap between two bodies' edges, in world units, at which they fall silent
+            const voiceLevel = 0.2;
+            const fmRatio = 1;                   // modulator frequency relative to the carrier; 1 keeps the FM harmonic
+            const maxFmIndex = 6;
+            const glide = 0.03;                  // seconds a voice takes to slide to a new note: an octave jump or a change of scale
+            const delayTime = 0.375;             // seconds
+            const reverbSeconds = 6;             // length of the reverb's tail (was 3)
+            const maxReverb = 2;                 // reverb send at the top of the vortex pad (was 1)
+            const maxWow = 0.012;                // seconds the tape delay drifts by at full field X; about ±6% pitch
+            const maxFlutter = 0.00008;          // seconds of fast shimmer on top at full field X; about ±1% pitch
+            const maxDropoutRate = 0.5;          // dropouts per second at full field Y
+            const maxCrackleRate = 25;           // tiny crackles per second at full field Y
+            const maxPopRate = 1.2;              // louder pops per second at full field Y
+            const crackleLevel = 0.03;
+            const popLevel = 0.11;
+            const tapeSoftness = 2.5;            // shape of the saturation curve; higher rounds off sooner
+            const maxVolume = 1.5;               // output level with the moon full; it starts at 0.8, which is about the level it always had
+
+            let masterVolume = 0.8;              // set by the moon
+            const routings = ['order', 'parallel', 'reverse'];
+            let routing = 'order';               // set by the flow sigil: vortex then field, side by side, or field then vortex
+
+            // A voice's note in semitones above the root, before any octave jumps. The heaviest body (rank 0) is lowest,
+            // and taking every other step of the scale keeps the chord open
+            function semitonesFor(rank) {
+                const scale = scales[scaleIndex];
+                const step = rank * 2;
+                return scale[step % scale.length] + 12 * Math.floor(step / scale.length);
+            }
+
+            // 1 when two bodies touch, fading to 0 when their edges are hearingRange apart
+            function closeness(a, aSize, b, bSize) {
+                const gap = Math.hypot(a.x - b.x, a.y - b.y) - aSize - bSize;
+                const t = Math.min(Math.max(1 - gap / hearingRange, 0), 1);
+                return t * t;
+            }
+
+            // Glides an audio setting toward a new value. A value that isn't a real number is skipped: the audio engine throws on one,
+            // which would stop the whole page
+            function glideTo(param, value, time, smoothing) {
+                if (Number.isFinite(value)) param.setTargetAtTime(value, time, smoothing);
+            }
+
+            class Sound {
+                constructor(bodies, blackHole, viewSize) {
+                    this.bodies = bodies;
+                    this.blackHole = blackHole;
+                    this.viewSize = viewSize;
+                    this.lastUpdate = -Infinity;
+                    const ctx = this.ctx = new AudioContext();
+
+                    // voices -> LP24 -> vortex block (dry + delay + reverb) and field block (tape), in the order the flow sigil is set to
+                    // -> limiter -> master volume -> speakers
+                    this.voiceBus = ctx.createGain();
+                    // An LP24 is two 12dB lowpasses in series; these Qs give it a flat (Butterworth) response.
+                    // Web Audio takes a lowpass's Q in dB
+                    this.lowpass = [0.5412, 1.3066].map(q => {
+                        const filter = ctx.createBiquadFilter();
+                        filter.type = 'lowpass';
+                        filter.Q.value = 20 * Math.log10(q);
+                        return filter;
+                    });
+                    this.voiceBus.connect(this.lowpass[0]);
+                    this.lowpass[0].connect(this.lowpass[1]);
+                    this.source = ctx.createGain(); // where the effects pick the sound up
+                    this.source.gain.value = 0.8;
+                    this.lowpass[1].connect(this.source);
+
+                    this.output = ctx.createGain(); // where the effects hand it back; dips for a moment while they're rewired
+                    const limiter = ctx.createDynamicsCompressor();
+                    limiter.threshold.value = -10;
+                    limiter.ratio.value = 12;
+                    this.volume = ctx.createGain();
+                    this.volume.gain.value = maxVolume * masterVolume ** 2;
+                    this.output.connect(limiter);
+                    limiter.connect(this.volume);
+                    this.volume.connect(ctx.destination);
+
+                    // Field block, tape: wow and flutter -> saturation -> high-end loss -> dropouts
+                    // Wow and flutter wobble a short delay's length, which bends the pitch like an uneven tape speed
+                    this.tapeIn = ctx.createGain();
+                    const tapeDelay = ctx.createDelay(0.1);
+                    tapeDelay.delayTime.value = 0.03; // leaves room for the wobble to swing both ways; must stay above 2 × (maxWow + maxFlutter)
+                    this.wow = ctx.createGain();
+                    this.flutter = ctx.createGain();
+                    this.wow.gain.value = 0;
+                    this.flutter.gain.value = 0;
+                    // Two slow sines at unrelated rates so the wow drifts instead of cycling; two faster, smaller ones for flutter
+                    for (const [rate, depth] of [[0.5, this.wow], [0.31, this.wow], [8.7, this.flutter], [13.1, this.flutter]]) {
+                        const wobble = ctx.createOscillator();
+                        wobble.frequency.value = rate;
+                        wobble.connect(depth);
+                        wobble.start();
+                    }
+                    this.wow.connect(tapeDelay.delayTime);
+                    this.flutter.connect(tapeDelay.delayTime);
+
+                    this.drive = ctx.createGain();
+                    const saturation = ctx.createWaveShaper();
+                    saturation.curve = Sound.tapeCurve();
+                    saturation.oversample = '2x';
+                    this.makeup = ctx.createGain(); // undoes the drive, so only the saturation changes, not the level
+                    this.tapeTone = ctx.createBiquadFilter();
+                    this.tapeTone.type = 'lowpass';
+                    this.tapeTone.Q.value = -3; // dB; a gentle roll-off with no peak
+                    this.dropout = ctx.createGain();
+                    this.dropoutEnd = 0;
+
+                    // Pops and crackle: short bursts made once up front, then fired at random. They join before the saturation,
+                    // so they crunch, dull and drop out along with everything else on the tape
+                    this.crackleBus = ctx.createGain();
+                    this.crackles = Array.from({ length: 12 }, () => Sound.burst(ctx, 0.001 + 0.003 * Math.random(), 1));
+                    this.pops = Array.from({ length: 6 }, () => Sound.burst(ctx, 0.01 + 0.02 * Math.random(), 0.15));
+
+                    this.tapeIn.connect(tapeDelay);
+                    tapeDelay.connect(this.drive);
+                    this.crackleBus.connect(this.drive);
+                    this.drive.connect(saturation);
+                    saturation.connect(this.makeup);
+                    this.makeup.connect(this.tapeTone);
+                    this.tapeTone.connect(this.dropout);
+                    this.tapeOut = this.dropout;
+
+                    // Vortex block: dry, ping-pong delay and reverb. The dry and the wet (echoes and reverb) come out separately,
+                    // so side by side can send just the dry through tape
+                    this.spaceIn = ctx.createGain();
+                    this.spaceWet = ctx.createGain();
+                    this.dry = ctx.createGain();
+                    this.spaceIn.connect(this.dry);
+
+                    // Ping-pong delay: the send is summed to mono and the first echo lands on the left; each side then feeds the other,
+                    // so the echoes bounce left, right, left
+                    this.delaySend = ctx.createGain();
+                    this.delaySend.gain.value = 0;
+                    this.delaySend.channelCount = 1;
+                    this.delaySend.channelCountMode = 'explicit';
+                    const left = ctx.createDelay(1);
+                    const right = ctx.createDelay(1);
+                    left.delayTime.value = delayTime;
+                    right.delayTime.value = delayTime;
+                    this.feedback = [ctx.createGain(), ctx.createGain()]; // left into right, right into left
+                    for (const gain of this.feedback) gain.gain.value = 0;
+                    const echoes = ctx.createChannelMerger(2);
+                    this.spaceIn.connect(this.delaySend);
+                    this.delaySend.connect(left);
+                    left.connect(this.feedback[0]);
+                    this.feedback[0].connect(right);
+                    right.connect(this.feedback[1]);
+                    this.feedback[1].connect(left);
+                    left.connect(echoes, 0, 0);
+                    right.connect(echoes, 0, 1);
+                    echoes.connect(this.spaceWet);
+
+                    this.reverbSend = ctx.createGain();
+                    this.reverbSend.gain.value = 0;
+                    const reverb = ctx.createConvolver();
+                    reverb.buffer = Sound.impulse(ctx, reverbSeconds);
+                    this.spaceIn.connect(this.reverbSend);
+                    echoes.connect(this.reverbSend); // so the echoes reverberate too
+                    this.reverbSend.connect(reverb);
+                    reverb.connect(this.spaceWet);
+
+                    this.route(routing);
+
+                    this.voices = bodies.map(() => ({ nearHole: false, nearFriend: false }));
+
+                    // Rank by mass, heaviest first: it sets which step of the scale each body sings (see semitonesFor)
+                    const byMass = bodies.map((body, i) => i).sort((a, b) => Math.abs(bodies[b].mass) - Math.abs(bodies[a].mass));
+                    byMass.forEach((bodyIndex, rank) => { this.voices[bodyIndex].rank = rank; });
+
+                    // Best friends form one shuffled loop, so every body is also somebody's best friend
+                    const ring = bodies.map((body, i) => i);
+                    for (let i = ring.length - 1; i > 0; i--) {
+                        const j = Math.floor(Math.random() * (i + 1));
+                        [ring[i], ring[j]] = [ring[j], ring[i]];
+                    }
+                    ring.forEach((bodyIndex, k) => this.voices[bodyIndex].friend = ring[(k + 1) % ring.length]);
+
+                    // Each voice: sine modulator -> sine carrier's pitch (FM) -> volume -> stereo position
+                    for (const voice of this.voices) {
+                        voice.carrier = ctx.createOscillator();
+                        voice.modulator = ctx.createOscillator();
+                        voice.depth = ctx.createGain(); // how far, in Hz, the modulator swings the carrier
+                        voice.amp = ctx.createGain();
+                        voice.pan = ctx.createStereoPanner();
+                        const note = rootFrequency * 2 ** (semitonesFor(voice.rank) / 12);
+                        voice.carrier.frequency.value = note;
+                        voice.modulator.frequency.value = note * fmRatio;
+                        voice.depth.gain.value = 0;
+                        voice.amp.gain.value = 0;
+                        voice.modulator.connect(voice.depth);
+                        voice.depth.connect(voice.carrier.frequency);
+                        voice.carrier.connect(voice.amp);
+                        voice.amp.connect(voice.pan);
+                        voice.pan.connect(this.voiceBus);
+                        voice.carrier.start();
+                        voice.modulator.start();
+                    }
+
+                    // Pause the sound along with the visuals while the tab is hidden
+                    document.addEventListener('visibilitychange', () => document.hidden ? ctx.suspend() : ctx.resume());
+                }
+
+                // Chains the vortex block (delay and reverb) and the field block (tape) one of three ways
+                route(mode) {
+                    const wires = {
+                        // vortex then field: the echoes and reverb are recorded to tape too
+                        order: [[this.source, this.spaceIn], [this.dry, this.tapeIn], [this.spaceWet, this.tapeIn], [this.tapeOut, this.output]],
+                        // side by side: only the dry sound goes to tape, and the echoes and reverb join afterwards, untouched by it
+                        parallel: [[this.source, this.spaceIn], [this.dry, this.tapeIn], [this.tapeOut, this.output], [this.spaceWet, this.output]],
+                        // field then vortex: it's the taped sound that echoes and reverberates
+                        reverse: [[this.source, this.tapeIn], [this.tapeOut, this.spaceIn], [this.dry, this.output], [this.spaceWet, this.output]],
+                    }[mode];
+                    // These four only ever feed the routing, so clearing all their connections clears exactly the old route
+                    for (const node of [this.source, this.dry, this.spaceWet, this.tapeOut]) node.disconnect();
+                    for (const [from, to] of wires) from.connect(to);
+                }
+
+                // Rewires under a quick dip in the output, so the switch doesn't click
+                setRoute(mode) {
+                    this.output.gain.setTargetAtTime(0, this.ctx.currentTime, 0.01);
+                    setTimeout(() => {
+                        this.route(mode);
+                        this.output.gain.setTargetAtTime(1, this.ctx.currentTime, 0.02);
+                    }, 60);
+                }
+
+                // Stereo noise that dies away over `seconds`
+                static impulse(ctx, seconds) {
+                    const length = Math.round(seconds * ctx.sampleRate);
+                    const buffer = ctx.createBuffer(2, length, ctx.sampleRate);
+                    for (let channel = 0; channel < 2; channel++) {
+                        const data = buffer.getChannelData(channel);
+                        for (let i = 0; i < length; i++) {
+                            data[i] = (Math.random() * 2 - 1) * (1 - i / length) ** 4;
+                        }
+                    }
+                    return buffer;
+                }
+
+                // A click: noise that dies away fast. brightness 1 is raw noise, a crisp tick; lower smooths it into a duller thump.
+                // It starts at full height, so even the dull ones have a sharp front
+                static burst(ctx, seconds, brightness) {
+                    const length = Math.max(2, Math.round(seconds * ctx.sampleRate));
+                    const buffer = ctx.createBuffer(1, length, ctx.sampleRate);
+                    const data = buffer.getChannelData(0);
+                    let smooth = Math.random() < 0.5 ? -1 : 1;
+                    let peak = 0;
+                    for (let i = 0; i < length; i++) {
+                        smooth += (Math.random() * 2 - 1 - smooth) * brightness;
+                        data[i] = smooth * Math.exp(-5 * i / length);
+                        peak = Math.max(peak, Math.abs(data[i]));
+                    }
+                    for (let i = 0; i < length; i++) data[i] /= peak;
+                    return buffer;
+                }
+
+                // How many random events land in a stretch of time when `expected` of them are due on average
+                static poisson(expected) {
+                    const limit = Math.exp(-expected);
+                    let count = 0;
+                    let p = Math.random();
+                    while (p > limit) {
+                        count++;
+                        p *= Math.random();
+                    }
+                    return count;
+                }
+
+                // Plays one of `buffers` at a random moment in the next `window` seconds, at a random level and stereo position
+                fire(buffers, level, t, window) {
+                    const source = this.ctx.createBufferSource();
+                    source.buffer = buffers[Math.floor(Math.random() * buffers.length)];
+                    const gain = this.ctx.createGain();
+                    gain.gain.value = level * (0.3 + 0.7 * Math.random()) * (Math.random() < 0.5 ? -1 : 1);
+                    const pan = this.ctx.createStereoPanner();
+                    pan.pan.value = Math.random() * 1.6 - 0.8;
+                    source.connect(gain);
+                    gain.connect(pan);
+                    pan.connect(this.crackleBus);
+                    source.start(t + Math.random() * window);
+                }
+
+                // Soft clipping: straight for quiet signals, rounding off loud ones
+                static tapeCurve() {
+                    const curve = new Float32Array(2049);
+                    for (let i = 0; i < curve.length; i++) {
+                        const x = i / (curve.length - 1) * 2 - 1;
+                        curve[i] = Math.tanh(tapeSoftness * x) / Math.tanh(tapeSoftness);
+                    }
+                    return curve;
+                }
+
+                update(now) {
+                    if (now - this.lastUpdate < 15) return; // ~60 updates a second is plenty
+                    const elapsed = Math.min(now - this.lastUpdate, 100) / 1000;
+                    this.lastUpdate = now;
+                    const t = this.ctx.currentTime;
+
+                    glideTo(this.volume.gain, maxVolume * masterVolume ** 2, t, 0.03);
+
+                    // Tape. Squared, so the middle of the pad is subtle and the extremes are where it gets obvious
+                    const wobble = field.getX(now) ** 2;
+                    glideTo(this.wow.gain, wobble * maxWow, t, 0.1);
+                    glideTo(this.flutter.gain, wobble * maxFlutter, t, 0.1);
+                    const wear = field.getY(now);
+                    const drive = 0.45 + 1.35 * wear;
+                    glideTo(this.drive.gain, drive, t, 0.05);
+                    // The curve's slope at zero is tapeSoftness / tanh(tapeSoftness); dividing it back out keeps quiet signals at the same level
+                    glideTo(this.makeup.gain, Math.tanh(tapeSoftness) / (tapeSoftness * drive), t, 0.05);
+                    // Pops and crackle, spread over the stretch until the next update
+                    const crackles = Sound.poisson(maxCrackleRate * wear * wear * elapsed);
+                    for (let i = 0; i < crackles; i++) this.fire(this.crackles, crackleLevel, t, elapsed);
+                    const pops = Sound.poisson(maxPopRate * wear * wear * elapsed);
+                    for (let i = 0; i < pops; i++) this.fire(this.pops, popLevel, t, elapsed);
+                    const toneCutoff = 16000 * (7 / 16) ** wear; // 16 kHz down to 7 kHz as the tape wears
+                    if (t >= this.dropoutEnd) {
+                        glideTo(this.tapeTone.frequency, toneCutoff, t, 0.05);
+                        // Dropouts: at random, the level dips and the highs go dull for a moment, as if the tape lost contact with the head
+                        if (Math.random() < maxDropoutRate * wear * wear * elapsed) {
+                            const length = 0.04 + 0.16 * Math.random();
+                            const depth = 0.3 + 0.5 * wear * Math.random();
+                            this.dropoutEnd = t + length;
+                            glideTo(this.dropout.gain, 1 - depth, t, 0.01);
+                            glideTo(this.dropout.gain, 1, t + length, 0.03);
+                            glideTo(this.tapeTone.frequency, 2500, t, 0.01);
+                            glideTo(this.tapeTone.frequency, toneCutoff, t + length, 0.03);
+                        }
+                    }
+
+                    const cutoff = 60 * 2 ** (orbital.getX(now) * 8); // 60 Hz to 15 kHz
+                    for (const filter of this.lowpass) glideTo(filter.frequency, cutoff, t, 0.05);
+                    const fmIndex = orbital.getY(now) * maxFmIndex;
+
+                    const delayAmount = vortex.getX(now);
+                    glideTo(this.delaySend.gain, delayAmount, t, 0.05);
+                    for (const gain of this.feedback) glideTo(gain.gain, delayAmount * 0.75, t, 0.05);
+                    const reverbAmount = vortex.getY(now);
+                    // Squared, so the middle of the pad is as wet as it was and the extra comes at the top
+                    glideTo(this.reverbSend.gain, maxReverb * reverbAmount * reverbAmount, t, 0.05);
+                    glideTo(this.dry.gain, 1 - reverbAmount * 0.5, t, 0.05);
+
+                    const hole = this.blackHole;
+                    for (let i = 0; i < this.bodies.length; i++) {
+                        const body = this.bodies[i];
+                        const voice = this.voices[i];
+                        const size = Math.abs(body.mass);
+
+                        // Louder the closer it is to the other bodies and the black hole; alone in empty space it's silent
+                        const toHole = closeness(body, size, hole, hole.size);
+                        let loudness = toHole;
+                        for (let j = 0; j < this.bodies.length; j++) {
+                            if (j !== i) loudness += closeness(body, size, this.bodies[j], Math.abs(this.bodies[j].mass));
+                        }
+                        loudness = Math.min(loudness, 1);
+
+                        // An octave down next to the black hole, an octave up next to its best friend.
+                        // They switch on closer than they switch off, so a body hovering at the edge doesn't warble
+                        const friend = this.bodies[voice.friend];
+                        const toFriend = closeness(body, size, friend, Math.abs(friend.mass));
+                        if (toHole > 0.5) voice.nearHole = true;
+                        else if (toHole < 0.3) voice.nearHole = false;
+                        if (toFriend > 0.5) voice.nearFriend = true;
+                        else if (toFriend < 0.3) voice.nearFriend = false;
+                        const octave = (voice.nearFriend ? 1 : 0) - (voice.nearHole ? 1 : 0);
+                        // Changing the scale moves the note too; the glide below slides it there
+                        const frequency = rootFrequency * 2 ** (semitonesFor(voice.rank) / 12 + octave);
+
+                        glideTo(voice.carrier.frequency, frequency, t, glide);
+                        glideTo(voice.modulator.frequency, frequency * fmRatio, t, glide);
+                        glideTo(voice.depth.gain, frequency * fmRatio * fmIndex, t, glide);
+                        glideTo(voice.amp.gain, voiceLevel * loudness, t, 0.08);
+                        const pan = (body.x - hole.x) / (this.viewSize / 2); // left to right across the pad
+                        glideTo(voice.pan.pan, Math.min(Math.max(pan, -1), 1), t, 0.05);
+                    }
+                }
+            }
+
+            let sound = null;
+            // Browsers only allow audio once the page has been touched or clicked. It's set up on the first press, and asked to start on
+            // releases too, because phones only count a finished tap as permission. Capture phase, so it still starts when that press grabs a modulator
+            function startSound() {
+                if (!sound) {
+                    // On iPhones, play even with the ring/silent switch on silent, like a music app rather than a notification
+                    if (navigator.audioSession) navigator.audioSession.type = 'playback';
+                    sound = new Sound(gravitySim.bodies, gravitySim.blackHole, gravitySim.viewSize);
+                }
+                if (sound.ctx.state !== 'running') sound.ctx.resume();
+            }
+            for (const type of ['pointerdown', 'pointerup', 'touchend']) addEventListener(type, startSound, { capture: true });
+
+            // Where the pads and corner sigils are, measured once a frame and shared, and how to keep the modulators placed sensibly as the
+            // window resizes or the phone turns. Each modulator is anchored one of three ways: to a pad, if it was dropped within reach of one
+            // (it stays on that pad, in the same spot relative to it); to its home below the pads, until it's first moved; or else to the same
+            // fraction of the window
+            const layout = {
+                width: 0,
+                height: 0,
+                padSize: 0,
+                padRects: [],
+                padsBottom: 0,
+                sigilsTop: 0,
+                inARow: true,
+                changed: true,  // whether any of the above moved since the last frame
+
+                // Returns false if there's no room to draw anything this frame (a window squashed flat, say)
+                measure() {
+                    const width = innerWidth, height = innerHeight;
+                    const padRects = pads.map(pad => pad.canvas.getBoundingClientRect());
+                    const sigils = document.querySelector('.sigils');
+                    const sigilsTop = sigils ? sigils.getBoundingClientRect().top : height;
+                    const padSize = padRects[0].width;
+                    this.changed = width !== this.width || height !== this.height || padSize !== this.padSize || sigilsTop !== this.sigilsTop;
+                    Object.assign(this, {
+                        width, height, padSize, padRects, sigilsTop,
+                        padsBottom: Math.max(...padRects.map(rect => rect.bottom)),
+                        inARow: padRects[3].top === padRects[0].top,
+                    });
+                    return width >= 8 && height >= 8 && padSize >= 8;
+                },
+
+                // Halfway down the space between the pads and the sigils
+                bandMiddle() {
+                    return (this.padsBottom + this.sigilsTop) / 2;
+                },
+
+                // How to keep something just dropped at (x, y): on the nearest pad within `reach` pad widths, or else as a fraction of the window
+                anchorAt(x, y, reach) {
+                    let best = null;
+                    this.padRects.forEach((rect, pad) => {
+                        const dx = (x - (rect.left + rect.width / 2)) / rect.width;
+                        const dy = (y - (rect.top + rect.height / 2)) / rect.width;
+                        const distance = Math.hypot(dx, dy);
+                        if (distance < reach && (!best || distance < best.distance)) best = { pad, dx, dy, distance };
+                    });
+                    return best ? { pad: best.pad, dx: best.dx, dy: best.dy } : { fx: x / this.width, fy: y / this.height };
+                },
+
+                // Where an anchor puts it now. `home` works out the modulator's own resting spot
+                place(anchor, home) {
+                    if (anchor.pad !== undefined) {
+                        const rect = this.padRects[anchor.pad];
+                        return { x: rect.left + rect.width * (0.5 + anchor.dx), y: rect.top + rect.height / 2 + rect.width * anchor.dy };
+                    }
+                    if (anchor.fx !== undefined) return { x: anchor.fx * this.width, y: anchor.fy * this.height };
+                    return home();
+                },
+            };
+            layout.measure(); // so the modulators below can find their homes
+
+            // How strongly a modulator at (x, y) reaches each pad: fully within fullReach pad widths of the pad's centre, fading to nothing at noReach
+            function padReach(x, y, fullReach, noReach) {
+                return layout.padRects.map(rect => {
+                    if (!(rect.width > 0)) return 0;
+                    const distance = Math.hypot(x - (rect.left + rect.width / 2), y - (rect.top + rect.height / 2)) / rect.width;
+                    const t = Math.min(Math.max((distance - fullReach) / (noReach - fullReach), 0), 1);
+                    return Number.isFinite(t) ? 1 - t * t * (3 - 2 * t) : 0;
+                });
+            }
+
+            // A small canvas that travels with a modulator, instead of one the size of the window: far less to clear and redraw each frame,
+            // and nothing big to rebuild while the window is being resized
+            function floatingCanvas() {
+                const canvas = document.createElement('canvas');
+                canvas.className = 'floating';
+                document.body.appendChild(canvas);
+                const ctx = canvas.getContext('2d');
+                return {
+                    // Covers `half` pixels either side of (x, y), cleared, with the drawing set up in page coordinates
+                    begin(x, y, half) {
+                        const ratio = pixelRatio();
+                        const size = Math.max(1, Math.ceil(half * 2));
+                        if (canvas.width !== Math.round(size * ratio)) {
+                            canvas.width = canvas.height = Math.round(size * ratio);
+                            canvas.style.width = canvas.style.height = `${size}px`;
+                        }
+                        const left = Math.round(x - size / 2), top = Math.round(y - size / 2);
+                        canvas.style.transform = `translate(${left}px, ${top}px)`;
+                        ctx.setTransform(ratio, 0, 0, ratio, -left * ratio, -top * ratio);
+                        ctx.clearRect(left, top, size, size);
+                        ctx.lineWidth = 1;
+                        return ctx;
+                    },
+                };
+            }
+
+            // A pad's outline brightens with how strongly the modulators reach it, all together
+            function outlinePads() {
+                for (const pad of pads) {
+                    const amount = Math.min(Object.values(pad.mods).reduce((sum, mod) => sum + mod.amount, 0), 1);
+                    const level = Math.round(0x33 + (0xcc - 0x33) * amount);
+                    const outline = amount > 0.01 ? `rgb(${level},${level},${level})` : '';
+                    if (pad.outline !== outline) pad.canvas.style.outlineColor = pad.outline = outline;
+                }
+            }
+
+            // Double pendulum chaos modifier. Drag it toward a pad and it nudges that pad's X and Y, by up to ±nudge:
+            // X by how far the lower bob is left or right of the pivot, Y by how far above or below it. The closer its pivot is to a pad's centre, the stronger
+            const pendulum = (() => {
+                const armLength = 0.175;     // each arm, as a fraction of a pad's width
+                const swingRate = 1;        // gravity ÷ arm length, in 1/s²; sets how quickly it swings
+                const chaos = 0.55;          // energy it settles back to: 0 hangs still, 1 is just enough to balance straight up
+                const settleRate = 1;      // how quickly it returns to that energy after being shaken, per second
+                const followRate = 10;       // how tightly the pivot follows the pointer while dragged, per second
+                const fullReach = 0.1;       // full effect within this many pad widths of a pad's centre...
+                const noReach = 0.7;         // ...fading to none at this many
+                const nudge = 0.3;           // furthest it can push a pad's X or Y either way, with the lower bob at full stretch
+                const stepTime = 1 / 500;    // s
+
+                const surface = floatingCanvas();
+
+                let length = armLength * layout.padSize;
+                // Starts at its home below the pads, out of reach of all of them
+                let anchor = { home: true };
+                const pivot = home();
+                const pivotVelocity = { x: 0, y: 0 };
+                const target = { x: pivot.x, y: pivot.y };
+                let angle1, angle2;              // radians from straight down
+                let spin1, spin2;                // radians per second
+                restart();
+                let grab = null;                 // pointer id and offset from the pivot while dragging
+                let last = null;
+                let acc = 0;
+                let energy = chaos;              // 0 hanging still to 1 balanced straight up; shown by the dotted outline
+
+                const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+                function restart() {
+                    angle1 = 2.0;
+                    angle2 = 2.8;
+                    spin1 = spin2 = 0;
+                }
+
+                // With the pads in a row: centred below them, as it always started. In the 2 × 2 grid (phones held upright): right of
+                // centre in the space below the pads, clear of the firefly ring and the sigils
+                function home() {
+                    if (layout.inARow) return { x: layout.width / 2, y: layout.height - 2.3 * length };
+                    return { x: layout.width * 0.62, y: layout.bandMiddle() };
+                }
+
+                // Angular accelerations of both arms (equal masses and lengths) with gravity of strength g pointing `tilt` radians from straight down
+                function accelerations(a1, a2, w1, w2, g, tilt) {
+                    const delta = a1 - a2;
+                    const s1 = a1 - tilt, s2 = a2 - tilt;
+                    const denominator = length * (3 - Math.cos(2 * delta));
+                    return [
+                        (-3 * g * Math.sin(s1) - g * Math.sin(s1 - 2 * s2)
+                            - 2 * Math.sin(delta) * length * (w2 * w2 + w1 * w1 * Math.cos(delta))) / denominator,
+                        2 * Math.sin(delta) * (2 * w1 * w1 * length + 2 * g * Math.cos(s1) + w2 * w2 * length * Math.cos(delta)) / denominator
+                    ];
+                }
+
+                function step(dt) {
+                    // The pivot springs toward where it's being dragged. The pendulum feels that acceleration as extra gravity the other way,
+                    // which is what makes shaking it throw the arms around
+                    const ax = followRate * followRate * (target.x - pivot.x) - 2 * followRate * pivotVelocity.x;
+                    const ay = followRate * followRate * (target.y - pivot.y) - 2 * followRate * pivotVelocity.y;
+                    pivotVelocity.x += ax * dt;
+                    pivotVelocity.y += ay * dt;
+                    pivot.x += pivotVelocity.x * dt;
+                    pivot.y += pivotVelocity.y * dt;
+
+                    const g = swingRate * length;
+                    const gx = -ax, gy = g - ay;
+                    const strength = Math.hypot(gx, gy);
+                    const tilt = Math.atan2(gx, gy);
+
+                    // Runge-Kutta: the arms whip around fast enough that a simpler step drifts badly
+                    const derivative = s => [s[2], s[3], ...accelerations(s[0], s[1], s[2], s[3], strength, tilt)];
+                    const advance = (s, d, h) => s.map((v, i) => v + d[i] * h);
+                    const s0 = [angle1, angle2, spin1, spin2];
+                    const d1 = derivative(s0);
+                    const d2 = derivative(advance(s0, d1, dt / 2));
+                    const d3 = derivative(advance(s0, d2, dt / 2));
+                    const d4 = derivative(advance(s0, d3, dt));
+                    [angle1, angle2, spin1, spin2] = s0.map((v, i) => v + dt / 6 * (d1[i] + 2 * d2[i] + 2 * d3[i] + d4[i]));
+
+                    // Ease the energy back toward `chaos`, so it never winds down and doesn't stay wild after a shake
+                    const kinetic = length * length * (spin1 * spin1 + 0.5 * spin2 * spin2 + spin1 * spin2 * Math.cos(angle1 - angle2));
+                    const potential = -g * length * (2 * Math.cos(angle1) + Math.cos(angle2));
+                    const goal = g * length * (6 * chaos - 3); // -3gL hanging still, +3gL balanced straight up
+                    energy = clamp((kinetic + potential + 3 * g * length) / (6 * g * length), 0, 1);
+                    if (kinetic > 1e-9) {
+                        const factor = 1 + settleRate * dt * (goal - (kinetic + potential)) / kinetic;
+                        const scale = Math.sqrt(clamp(factor, 0.96, 1.04));
+                        spin1 *= scale;
+                        spin2 *= scale;
+                    }
+                }
+
+                function bobs() {
+                    const x1 = pivot.x + length * Math.sin(angle1);
+                    const y1 = pivot.y + length * Math.cos(angle1);
+                    return { x1, y1, x2: x1 + length * Math.sin(angle2), y2: y1 + length * Math.cos(angle2) };
+                }
+
+                function update(now) {
+                    length = armLength * layout.padSize;
+                    // When the window resizes or the phone turns, it moves with whatever it's anchored to: straight there, without being swung
+                    if (layout.changed && !grab) {
+                        const spot = layout.place(anchor, home);
+                        target.x = pivot.x = spot.x;
+                        target.y = pivot.y = spot.y;
+                        pivotVelocity.x = pivotVelocity.y = 0;
+                    }
+                    target.x = clamp(target.x, 0, layout.width);
+                    target.y = clamp(target.y, 0, layout.height);
+
+                    if (last === null) last = now;
+                    acc += Math.min(Math.max(now - last, 0), 100) / 1000;
+                    last = now;
+                    while (acc >= stepTime) {
+                        step(stepTime);
+                        acc -= stepTime;
+                    }
+                    // If anything ever knocks its numbers out of range, start it swinging afresh rather than freeze
+                    if (![angle1, angle2, spin1, spin2, pivot.x, pivot.y].every(Number.isFinite)) {
+                        restart();
+                        Object.assign(pivot, target);
+                        pivotVelocity.x = pivotVelocity.y = 0;
+                    }
+
+                    // What it feeds the pads: the lower bob's offset from the pivot, scaled so full stretch (both arms, 2 × length) is ±nudge
+                    const { x2, y2 } = bobs();
+                    const modX = nudge * (x2 - pivot.x) / (2 * length);
+                    const modY = nudge * (pivot.y - y2) / (2 * length); // above the pivot pushes Y up
+
+                    const amounts = padReach(pivot.x, pivot.y, fullReach, noReach);
+                    pads.forEach((pad, i) => { pad.mods.pendulum = { x: modX, y: modY, amount: amounts[i] }; });
+                }
+
+                function draw() {
+                    // Big enough for the dotted outline at its widest
+                    const ctx = surface.begin(pivot.x, pivot.y, circleRadius() * 1.2 + 2);
+                    const { x1, y1, x2, y2 } = bobs();
+
+                    // A dotted outline like the firefly ring's tide, swelling with the pendulum's energy: it grows when shaken and eases back as it settles
+                    ctx.setLineDash([2, 4]);
+                    ctx.beginPath();
+                    ctx.arc(pivot.x, pivot.y, circleRadius() * (1.12 + 0.08 * energy), 0, 2 * Math.PI);
+                    ctx.strokeStyle = `rgba(255,255,255,${0.1 + 0.15 * energy})`;
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    // The circle the lower bob can reach. It glows as the bob nears it, which is when the pendulum nudges hardest
+                    const stretch = Math.hypot(x2 - pivot.x, y2 - pivot.y) / (2 * length);
+                    ctx.beginPath();
+                    ctx.arc(pivot.x, pivot.y, circleRadius(), 0, 2 * Math.PI);
+                    ctx.strokeStyle = `rgba(255,255,255,${0.2 + 0.6 * stretch ** 8})`;
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.moveTo(pivot.x, pivot.y);
+                    ctx.lineTo(x1, y1);
+                    ctx.lineTo(x2, y2);
+                    ctx.strokeStyle = 'white';
+                    ctx.stroke();
+
+                    // Discs filled with the pads' background colour and outlined in white
+                    const bobRadius = 0.15 * length;
+                    for (const [x, y, r] of [[pivot.x, pivot.y, 3], [x1, y1, bobRadius], [x2, y2, bobRadius]]) {
+                        ctx.beginPath();
+                        ctx.arc(x, y, r, 0, 2 * Math.PI);
+                        ctx.fillStyle = '#111';
+                        ctx.fill();
+                        ctx.stroke();
+                    }
+                }
+
+                // Just clear of the lower bob at full stretch
+                function circleRadius() {
+                    return 2.15 * length + 3;
+                }
+
+                // Anywhere inside the circle grabs it, like the firefly ring; the bobs never leave the circle, so that covers them too
+                function isOver(e) {
+                    return Math.hypot(e.clientX - pivot.x, e.clientY - pivot.y) < circleRadius() + 6;
+                }
+
+                // Capture phase, so grabbing the pendulum over a pad doesn't also move that pad
+                addEventListener('pointerdown', e => {
+                    if (e.button !== 0 || !isOver(e)) return;
+                    e.stopPropagation();
+                    e.preventDefault();
+                    document.documentElement.setPointerCapture(e.pointerId);
+                    grab = { id: e.pointerId, dx: target.x - e.clientX, dy: target.y - e.clientY, startX: e.clientX, startY: e.clientY, moved: false };
+                    document.documentElement.classList.add('holding-pendulum');
+                }, { capture: true });
+                addEventListener('pointermove', e => {
+                    if (grab && e.pointerId === grab.id) {
+                        if (Math.hypot(e.clientX - grab.startX, e.clientY - grab.startY) > 3) grab.moved = true;
+                        target.x = e.clientX + grab.dx;
+                        target.y = e.clientY + grab.dy;
+                    }
+                    document.documentElement.classList.toggle('over-pendulum', !grab && isOver(e));
+                });
+                const release = e => {
+                    if (!grab || e.pointerId !== grab.id) return;
+                    // Wherever it was dropped is where it now belongs when the layout changes (a press that didn't move it leaves it as it was)
+                    if (grab.moved) anchor = layout.anchorAt(target.x, target.y, noReach);
+                    grab = null;
+                    document.documentElement.classList.remove('holding-pendulum');
+                };
+                addEventListener('pointerup', release);
+                addEventListener('pointercancel', release);
+
+                return { update, draw };
+            })();
+
+            // Firefly ring, a second modulator. Seven fireflies circle a ring, each at its own pace, tugging on each other; they flash as
+            // they pass the top. How hard they tug rises and falls like a tide, so about every 40 seconds they fall into step, flash
+            // together, then drift apart again. A hand from the centre points to where the swarm is on average and lengthens as they fall
+            // into step. A nearby pad's X and Y follow that hand by up to ±nudge: in step, the pad is pushed round in a steady circle;
+            // out of step, it barely moves. Drag it like the pendulum; tap it to scatter them and let them find the beat again
+            const fireflies = (() => {
+                const count = 7;
+                const ringSize = 0.15;       // ring radius, as a fraction of a pad's width
+                const pace = 0.4;            // average laps per second
+                const spread = 0.12;         // how far the fastest and slowest stray from that, laps per second
+                const pullLow = 0.8;         // how hard they tug on each other at low tide, too weak to stay in step...
+                const pullHigh = 1.4;        // ...and at high tide, strong enough to lock (it happens at about 1.1)
+                const tide = 40;             // seconds from one high tide to the next
+                const fullReach = 0.1;       // full effect within this many pad widths of a pad's centre...
+                const noReach = 0.7;         // ...fading to none at this many
+                const nudge = 0.3;           // furthest it can push a pad's X or Y either way, with them all in step
+                const tapDistance = 5;       // pixels a press can move and still count as a tap
+                const followRate = 10;       // how tightly the ring follows the pointer while dragged, per second (like the pendulum's pivot)
+                const stepTime = 1 / 200;    // s
+
+                const surface = floatingCanvas();
+
+                let radius = ringSize * layout.padSize;
+                // Starts at its home below the pads, left of the pendulum, out of reach of all of them
+                let anchor = { home: true };
+                const centre = home();
+                const centreVelocity = { x: 0, y: 0 };
+                const target = { x: centre.x, y: centre.y }; // where it's being dragged to; the centre glides after it
+                let phases = scattered();
+                // Paces spread evenly, so the group always has a fastest and a slowest that are hardest to keep in step
+                const speeds = Array.from({ length: count }, (_, i) => 2 * Math.PI * (pace + spread * (2 * i / (count - 1) - 1)));
+                let clock = 0;
+                let hand = { x: 0, y: 0 };       // where the swarm is on average; its length is how in step they are (0 to 1)
+                let grab = null;
+                let last = null;
+                let acc = 0;
+
+                function scattered() {
+                    return Array.from({ length: count }, () => Math.random() * 2 * Math.PI);
+                }
+
+                // With the pads in a row: below them, left of the pendulum, as it always started. In the 2 × 2 grid (phones held upright):
+                // at the left of the space below the pads
+                function home() {
+                    if (layout.inARow) return { x: layout.width * 0.3, y: layout.height - 0.4 * layout.padSize };
+                    return { x: layout.width * 0.2, y: layout.bandMiddle() };
+                }
+
+                function step(dt) {
+                    // The centre springs toward where it's being dragged, without overshooting, the same way the pendulum's pivot does
+                    for (const axis of ['x', 'y']) {
+                        const accel = followRate * followRate * (target[axis] - centre[axis]) - 2 * followRate * centreVelocity[axis];
+                        centreVelocity[axis] += accel * dt;
+                        centre[axis] += centreVelocity[axis] * dt;
+                    }
+
+                    clock += dt;
+                    const pull = pullLow + (pullHigh - pullLow) * (0.5 - 0.5 * Math.cos(2 * Math.PI * clock / tide));
+                    // Each speeds up or slows down toward the others (the Kuramoto model of fireflies syncing)
+                    phases = phases.map((phase, i) => {
+                        let tug = 0;
+                        for (const other of phases) tug += Math.sin(other - phase);
+                        return (phase + (speeds[i] + pull * tug / count) * dt) % (2 * Math.PI);
+                    });
+                }
+
+                // Positions go clockwise from the top of the ring
+                const onRing = (phase, r) => ({ x: centre.x + r * Math.sin(phase), y: centre.y - r * Math.cos(phase) });
+
+                // Brightest passing the top of the ring
+                function flash(phase) {
+                    const fromTop = Math.atan2(Math.sin(phase), Math.cos(phase));
+                    return Math.exp(-((fromTop / 0.35) ** 2));
+                }
+
+                function update(now) {
+                    radius = ringSize * layout.padSize;
+                    // When the window resizes or the phone turns, it moves with whatever it's anchored to, straight there
+                    if (layout.changed && !grab) {
+                        const spot = layout.place(anchor, home);
+                        target.x = centre.x = spot.x;
+                        target.y = centre.y = spot.y;
+                        centreVelocity.x = centreVelocity.y = 0;
+                    }
+                    target.x = Math.min(Math.max(target.x, 0), layout.width);
+                    target.y = Math.min(Math.max(target.y, 0), layout.height);
+
+                    if (last === null) last = now;
+                    acc += Math.min(Math.max(now - last, 0), 100) / 1000;
+                    last = now;
+                    while (acc >= stepTime) {
+                        step(stepTime);
+                        acc -= stepTime;
+                    }
+
+                    hand = { x: 0, y: 0 };
+                    for (const phase of phases) {
+                        hand.x += Math.sin(phase) / count;
+                        hand.y += Math.cos(phase) / count;
+                    }
+
+                    // What it feeds the pads: the hand, right and up being positive
+                    const amounts = padReach(centre.x, centre.y, fullReach, noReach);
+                    pads.forEach((pad, i) => { pad.mods.fireflies = { x: nudge * hand.x, y: nudge * hand.y, amount: amounts[i] }; });
+                }
+
+                function draw() {
+                    // Big enough for the tide ring at its widest
+                    const ctx = surface.begin(centre.x, centre.y, radius * 1.45 + 2);
+
+                    // The tide: a faint outer ring that swells as their pull rises
+                    const pull = 0.5 - 0.5 * Math.cos(2 * Math.PI * clock / tide);
+                    ctx.setLineDash([2, 4]);
+                    ctx.beginPath();
+                    ctx.arc(centre.x, centre.y, radius * (1.3 + 0.15 * pull), 0, 2 * Math.PI);
+                    ctx.strokeStyle = `rgba(255,255,255,${0.1 + 0.15 * pull})`;
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    // The ring lights up when they flash together
+                    const inStep = Math.hypot(hand.x, hand.y);
+                    const together = inStep * flash(Math.atan2(hand.x, hand.y));
+                    ctx.beginPath();
+                    ctx.arc(centre.x, centre.y, radius, 0, 2 * Math.PI);
+                    ctx.strokeStyle = `rgba(255,255,255,${0.2 + 0.7 * together})`;
+                    ctx.stroke();
+
+                    // The hand
+                    ctx.beginPath();
+                    ctx.moveTo(centre.x, centre.y);
+                    ctx.lineTo(centre.x + radius * hand.x, centre.y - radius * hand.y);
+                    ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+                    ctx.stroke();
+
+                    // Centre and fireflies: discs in the pads' background colour, the fireflies lighting up white as they flash
+                    const discs = [[centre.x, centre.y, 3, 0], ...phases.map(phase => {
+                        const { x, y } = onRing(phase, radius);
+                        return [x, y, 0.13 * radius, flash(phase)];
+                    })];
+                    for (const [x, y, r, light] of discs) {
+                        const level = Math.round(0x11 + (0xff - 0x11) * light);
+                        ctx.beginPath();
+                        ctx.arc(x, y, r, 0, 2 * Math.PI);
+                        ctx.fillStyle = `rgb(${level},${level},${level})`;
+                        ctx.fill();
+                        ctx.strokeStyle = 'white';
+                        ctx.stroke();
+                    }
+                }
+
+                // Anywhere on the ring grabs it
+                function isOver(e) {
+                    return Math.hypot(e.clientX - centre.x, e.clientY - centre.y) < radius * 1.13 + 6;
+                }
+
+                // Capture phase, like the pendulum; if the pendulum already took this press, leave it
+                addEventListener('pointerdown', e => {
+                    if (e.button !== 0 || e.defaultPrevented || !isOver(e)) return;
+                    e.stopPropagation();
+                    e.preventDefault();
+                    document.documentElement.setPointerCapture(e.pointerId);
+                    grab = { id: e.pointerId, dx: target.x - e.clientX, dy: target.y - e.clientY, startX: e.clientX, startY: e.clientY, moved: false };
+                    document.documentElement.classList.add('holding-fireflies');
+                }, { capture: true });
+                addEventListener('pointermove', e => {
+                    if (grab && e.pointerId === grab.id) {
+                        if (Math.hypot(e.clientX - grab.startX, e.clientY - grab.startY) > tapDistance) grab.moved = true;
+                        if (grab.moved) {
+                            target.x = e.clientX + grab.dx;
+                            target.y = e.clientY + grab.dy;
+                        }
+                    }
+                    document.documentElement.classList.toggle('over-fireflies', !grab && isOver(e));
+                });
+                const release = e => {
+                    if (!grab || e.pointerId !== grab.id) return;
+                    if (!grab.moved && e.type === 'pointerup') phases = scattered(); // a tap scatters them
+                    // Wherever it was dropped is where it now belongs when the layout changes
+                    if (grab.moved) anchor = layout.anchorAt(target.x, target.y, noReach);
+                    grab = null;
+                    document.documentElement.classList.remove('holding-fireflies');
+                };
+                addEventListener('pointerup', release);
+                addEventListener('pointercancel', release);
+
+                return { update, draw };
+            })();
+
+            // Scale, master volume and effect order, as three wordless sigils in the corner.
+            // The key sigil is the scale the voices sing in, drawn on a twelve-point pitch clock: click for the next scale, or scroll either way.
+            // The moon is the volume: drag it up to wax, down to wane, or scroll on it. Faint halos gather around it as it gets louder.
+            // The flow sigil is the order of the vortex (delay and reverb, the little funnel) and the field (tape, the waves): click to
+            // cycle vortex then field, side by side, field then vortex. Dots run along the thread the way the sound flows
+            const sigils = (() => {
+                const holder = document.createElement('div');
+                holder.className = 'sigils';
+                document.body.appendChild(holder);
+
+                function makeSigil(className, label) {
+                    const canvas = document.createElement('canvas');
+                    canvas.className = `sigil ${className}`;
+                    canvas.setAttribute('aria-label', label); // read out by screen readers; nothing shows on the page
+                    holder.appendChild(canvas);
+                    return { canvas, ctx: canvas.getContext('2d') };
+                }
+
+                const key = makeSigil('key', 'Scale');
+                const moon = makeSigil('moon', 'Master volume');
+                const flow = makeSigil('flow', 'Effect order');
+                const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+                // Drag up or down, or scroll, to move a 0 to 1 setting. Dragging is relative to where it started, so a stray click never jumps it
+                function verticalControl(canvas, get, set) {
+                    let dragStart = null;
+                    canvas.addEventListener('pointerdown', e => {
+                        if (e.button !== 0) return;
+                        canvas.setPointerCapture(e.pointerId);
+                        dragStart = { y: e.clientY, value: get() };
+                    });
+                    canvas.addEventListener('pointermove', e => {
+                        if (!dragStart || !canvas.hasPointerCapture(e.pointerId)) return;
+                        const height = canvas.getBoundingClientRect().height;
+                        set(clamp(dragStart.value + (dragStart.y - e.clientY) / (height * 2), 0, 1));
+                    });
+                    canvas.addEventListener('pointerup', () => { dragStart = null; });
+                    canvas.addEventListener('wheel', e => {
+                        e.preventDefault();
+                        set(clamp(get() - e.deltaY * 0.0008, 0, 1));
+                    }, { passive: false });
+                }
+
+                verticalControl(moon.canvas, () => masterVolume, value => { masterVolume = value; });
+
+                // Scale: click for the next one, or scroll either way (a notch, or a trackpad swipe's worth, per scale)
+                key.canvas.addEventListener('pointerdown', e => {
+                    if (e.button !== 0) return;
+                    scaleIndex = (scaleIndex + 1) % scales.length;
+                });
+                let scrolled = 0;
+                key.canvas.addEventListener('wheel', e => {
+                    e.preventDefault();
+                    scrolled += e.deltaY;
+                    while (Math.abs(scrolled) >= 100) {
+                        const direction = Math.sign(scrolled);
+                        scaleIndex = (scaleIndex + direction + scales.length) % scales.length;
+                        scrolled -= direction * 100;
+                    }
+                }, { passive: false });
+
+                flow.canvas.addEventListener('pointerdown', e => {
+                    if (e.button !== 0) return;
+                    routing = routings[(routings.indexOf(routing) + 1) % routings.length];
+                    if (sound) sound.setRoute(routing);
+                });
+
+                // Where the two glyphs sit for each order, as fractions of the sigil; they glide between these
+                const layouts = {
+                    order: { vortex: [0.5, 0.33], field: [0.5, 0.67] },
+                    parallel: { vortex: [0.27, 0.5], field: [0.73, 0.5] },
+                    reverse: { vortex: [0.5, 0.67], field: [0.5, 0.33] },
+                };
+                const glyphs = { vortex: [...layouts[routing].vortex], field: [...layouts[routing].field] };
+                const threadAlpha = { order: 0, parallel: 0, reverse: 0 };
+                threadAlpha[routing] = 1;
+                let last = null;
+
+                function fit(sigil) {
+                    const dpr = pixelRatio();
+                    const size = sigil.canvas.clientWidth;
+                    if (sigil.canvas.width !== Math.round(size * dpr)) {
+                        sigil.canvas.width = sigil.canvas.height = Math.round(size * dpr);
+                    }
+                    sigil.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    sigil.ctx.clearRect(0, 0, size, size);
+                    sigil.ctx.lineWidth = 1;
+                    return size;
+                }
+
+                // The scale on a twelve-point pitch clock, root at the top. Its notes are joined into a shape, so every scale is its own
+                // sigil, and a new one fades in over the old. Notes the voices are singing light up, with rays from the centre, as loud as they sing
+                const shapeAlpha = scales.map((scale, i) => i === scaleIndex ? 1 : 0);
+                let keyLast = null;
+
+                function drawKey(now) {
+                    const ctx = key.ctx;
+                    const size = fit(key);
+                    const cx = size / 2, cy = size / 2, r = size * 0.34;
+                    const point = semitone => {
+                        const angle = -Math.PI / 2 + semitone / 12 * 2 * Math.PI;
+                        return [cx + r * Math.cos(angle), cy + r * Math.sin(angle)];
+                    };
+
+                    const dt = keyLast === null ? 0 : Math.min(now - keyLast, 100);
+                    keyLast = now;
+                    const ease = 1 - Math.exp(-dt / 120);
+                    scales.forEach((scale, i) => { shapeAlpha[i] += ((i === scaleIndex ? 1 : 0) - shapeAlpha[i]) * ease; });
+
+                    // How loudly each of the twelve pitches is being sung right now
+                    const sung = new Array(12).fill(0);
+                    if (sound) {
+                        for (const voice of sound.voices) {
+                            const pitch = semitonesFor(voice.rank) % 12;
+                            sung[pitch] = Math.max(sung[pitch], Math.min(voice.amp.gain.value / voiceLevel, 1));
+                        }
+                    }
+
+                    // All twelve pitches as faint points, and rays to the ones being sung
+                    for (let s = 0; s < 12; s++) {
+                        const [x, y] = point(s);
+                        ctx.beginPath();
+                        ctx.arc(x, y, 1, 0, 2 * Math.PI);
+                        ctx.fillStyle = 'rgba(255,255,255,0.3)';
+                        ctx.fill();
+                        if (sung[s] > 0.02) {
+                            ctx.beginPath();
+                            ctx.moveTo(cx, cy);
+                            ctx.lineTo(x, y);
+                            ctx.strokeStyle = `rgba(255,255,255,${0.5 * sung[s]})`;
+                            ctx.stroke();
+                        }
+                    }
+
+                    scales.forEach((scale, i) => {
+                        const alpha = shapeAlpha[i];
+                        if (alpha < 0.01) return;
+                        ctx.beginPath();
+                        scale.forEach((s, k) => {
+                            const [x, y] = point(s);
+                            if (k === 0) ctx.moveTo(x, y);
+                            else ctx.lineTo(x, y);
+                        });
+                        ctx.closePath();
+                        ctx.strokeStyle = `rgba(255,255,255,${0.5 * alpha})`;
+                        ctx.stroke();
+                        // Its notes: discs in the pads' background colour, lighting up white as they're sung
+                        for (const s of scale) {
+                            const [x, y] = point(s);
+                            const level = Math.round(0x11 + (0xff - 0x11) * (i === scaleIndex ? sung[s] : 0));
+                            ctx.beginPath();
+                            ctx.arc(x, y, size * 0.04, 0, 2 * Math.PI);
+                            ctx.fillStyle = `rgba(${level},${level},${level},${alpha})`;
+                            ctx.fill();
+                            ctx.strokeStyle = `rgba(255,255,255,${alpha})`;
+                            ctx.stroke();
+                        }
+                    });
+
+                    // A ring around the root, the one note every scale shares
+                    const [rootX, rootY] = point(0);
+                    ctx.beginPath();
+                    ctx.arc(rootX, rootY, size * 0.07, 0, 2 * Math.PI);
+                    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+                    ctx.stroke();
+                }
+
+                // A moon in the phase of the volume: new (just an outline) when silent, full when loudest. The lit part is hatched
+                // with level lines like the field pad's
+                function drawMoon() {
+                    const ctx = moon.ctx;
+                    const size = fit(moon);
+                    const cx = size / 2, cy = size / 2, r = size * 0.3;
+
+                    for (let k = 1; k <= 3; k++) {
+                        const alpha = 0.25 * clamp(masterVolume * 3 - (k - 1), 0, 1);
+                        if (alpha <= 0) continue;
+                        ctx.beginPath();
+                        ctx.arc(cx, cy, r * (1 + 0.18 * k), 0, 2 * Math.PI);
+                        ctx.strokeStyle = `rgba(255,255,255,${alpha})`;
+                        ctx.stroke();
+                    }
+
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+                    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+                    ctx.stroke();
+
+                    // Lit part: the right edge, then back along the terminator, which sweeps from the right edge (new) to the left (full)
+                    const terminator = 1 - 2 * masterVolume;
+                    const steps = 48;
+                    ctx.beginPath();
+                    for (let s = 0; s <= steps; s++) {
+                        const a = -Math.PI / 2 + Math.PI * s / steps;
+                        ctx.lineTo(cx + r * Math.cos(a), cy + r * Math.sin(a));
+                    }
+                    for (let s = steps; s >= 0; s--) {
+                        const a = -Math.PI / 2 + Math.PI * s / steps;
+                        ctx.lineTo(cx + terminator * r * Math.cos(a), cy + r * Math.sin(a));
+                    }
+                    ctx.closePath();
+                    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+                    ctx.stroke();
+                    ctx.save();
+                    ctx.clip();
+                    ctx.beginPath();
+                    for (let y = cy - r; y <= cy + r; y += 3) {
+                        ctx.moveTo(cx - r, y);
+                        ctx.lineTo(cx + r, y);
+                    }
+                    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+                    ctx.stroke();
+                    ctx.restore();
+                }
+
+                // The vortex pad in miniature: a few stacked rings narrowing downward
+                function drawFunnel(ctx, x, y, size) {
+                    for (let k = 0; k < 4; k++) {
+                        const width = size * 0.13 * (1 - k * 0.22);
+                        ctx.beginPath();
+                        ctx.ellipse(x, y + (k - 1.5) * size * 0.035, width, width * 0.35, 0, 0, 2 * Math.PI);
+                        ctx.strokeStyle = `rgba(255,255,255,${1 - k * 0.2})`;
+                        ctx.stroke();
+                    }
+                }
+
+                // The field pad in miniature: three slow waves that flatten toward their ends
+                function drawWaves(ctx, x, y, size, now) {
+                    ctx.beginPath();
+                    for (let k = -1; k <= 1; k++) {
+                        for (let s = 0; s <= 24; s++) {
+                            const u = s / 24;
+                            const px = x + (u - 0.5) * size * 0.26;
+                            const py = y + k * size * 0.04 + Math.sin(Math.PI * u) * size * 0.015 * Math.sin(u * 9 + now / 600 + k * 1.7);
+                            if (s === 0) ctx.moveTo(px, py);
+                            else ctx.lineTo(px, py);
+                        }
+                    }
+                    ctx.strokeStyle = 'white';
+                    ctx.stroke();
+                }
+
+                // The thread the sound follows for each order, as lines between points
+                function threads(mode, size) {
+                    const point = ([x, y]) => [x * size, y * size];
+                    const top = ([x, y]) => [x * size, (y - 0.08) * size];
+                    const bottom = ([x, y]) => [x * size, (y + 0.08) * size];
+                    const entry = point([0.5, 0.06]), exit = point([0.5, 0.94]);
+                    const { vortex, field } = glyphs;
+                    if (mode === 'parallel') {
+                        const split = point([0.5, 0.2]), join = point([0.5, 0.8]);
+                        return [[entry, split, top(vortex)], [entry, split, top(field)], [bottom(vortex), join, exit], [bottom(field), join, exit]];
+                    }
+                    const [first, second] = mode === 'order' ? [vortex, field] : [field, vortex];
+                    return [[entry, top(first)], [bottom(first), top(second)], [bottom(second), exit]];
+                }
+
+                // A point a given fraction of the way along a line of points
+                function along(line, fraction) {
+                    const lengths = line.slice(1).map((p, i) => Math.hypot(p[0] - line[i][0], p[1] - line[i][1]));
+                    let remaining = fraction * lengths.reduce((a, b) => a + b, 0);
+                    for (let i = 0; i < lengths.length; i++) {
+                        if (remaining <= lengths[i] || i === lengths.length - 1) {
+                            const t = lengths[i] > 0 ? Math.min(remaining / lengths[i], 1) : 0;
+                            return [line[i][0] + (line[i + 1][0] - line[i][0]) * t, line[i][1] + (line[i + 1][1] - line[i][1]) * t];
+                        }
+                        remaining -= lengths[i];
+                    }
+                }
+
+                function drawFlow(now) {
+                    const ctx = flow.ctx;
+                    const size = fit(flow);
+
+                    // Glyphs glide to the current order's places; the old order's thread fades out as the new one fades in
+                    const dt = last === null ? 0 : Math.min(now - last, 100);
+                    last = now;
+                    const ease = 1 - Math.exp(-dt / 120);
+                    for (const name of ['vortex', 'field']) {
+                        for (let axis = 0; axis < 2; axis++) glyphs[name][axis] += (layouts[routing][name][axis] - glyphs[name][axis]) * ease;
+                    }
+                    for (const mode of routings) threadAlpha[mode] += ((mode === routing ? 1 : 0) - threadAlpha[mode]) * ease;
+
+                    const pulse = (now / 1000 * 0.6) % 1;
+                    for (const mode of routings) {
+                        const alpha = threadAlpha[mode];
+                        if (alpha < 0.01) continue;
+                        for (const line of threads(mode, size)) {
+                            ctx.beginPath();
+                            line.forEach(([x, y], i) => i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y));
+                            ctx.strokeStyle = `rgba(255,255,255,${0.45 * alpha})`;
+                            ctx.stroke();
+                            const [x, y] = along(line, pulse);
+                            ctx.beginPath();
+                            ctx.arc(x, y, 1.5, 0, 2 * Math.PI);
+                            ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+                            ctx.fill();
+                        }
+                    }
+
+                    // Where the sound comes in and goes out
+                    for (const y of [0.06, 0.94]) {
+                        ctx.beginPath();
+                        ctx.arc(size / 2, y * size, 2.5, 0, 2 * Math.PI);
+                        ctx.fillStyle = '#111';
+                        ctx.fill();
+                        ctx.strokeStyle = 'white';
+                        ctx.stroke();
+                    }
+
+                    drawFunnel(ctx, glyphs.vortex[0] * size, glyphs.vortex[1] * size, size);
+                    drawWaves(ctx, glyphs.field[0] * size, glyphs.field[1] * size, size, now);
+                }
+
+                return {
+                    draw(now) {
+                        drawKey(now);
+                        drawMoon();
+                        drawFlow(now);
+                    }
+                };
+            })();
+
+            let reported = false;
+            function loop(now) {
+                // Next frame first, so a frame that goes wrong can't stop the animation
+                requestAnimationFrame(loop);
+                // Nothing to draw into (a window squashed flat while being resized, say): wait for room, rather than feed zero sizes
+                // into everything. The sims pick up where they left off, as if the time had been a pause
+                if (!layout.measure()) return;
+                try {
+                    pendulum.update(now);
+                    fireflies.update(now);
+                    outlinePads();
+                    for (const pad of pads) pad.render(now);
+                    if (sound) sound.update(now);
+                    pendulum.draw();
+                    fireflies.draw();
+                    sigils.draw(now);
+                } catch (error) {
+                    if (!reported) console.error(error); // once, rather than every frame
+                    reported = true;
+                }
+            }
+            requestAnimationFrame(loop);
+        </script>
+    </body>
+</html>
